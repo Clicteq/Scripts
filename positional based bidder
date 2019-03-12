@@ -1,0 +1,256 @@
+/**********************
+ *
+ * AdWords script to pull keyword performance data into a Google Sheet.
+ * Data is averaged by date and pivoted by average position.
+ *
+ * Parameters include:
+ * - Sheet URL
+ * - Start and end dates
+ * - Include/exclude paused ads
+ * - Include/exclude ads with no conversions
+ * - Lists of campaigns to include/exclude (or shows all)
+ * - Output currency
+ *
+ */
+function main() {
+  ///////////////////////// BEGIN USER EDIT AREA /////////////////////////////
+  //Enter the url of the sheet where you want the data to be added
+  var sheetURL = "Enter Google Sheet URL Here";
+  //Enter start and end dates in this format:  2018-04-10
+  var startDate = "2018-04-01";
+  var endDate = "2018-04-28"
+  //Include paused ads?
+  var includePaused = false;
+  //Include ads with no conversions?
+  var includeNoConversions = true;
+  //List of campaign names to include (leave blank for all)
+  var includeCampaigns = [];// e.g. ["My campaign 1", "My campaign 2"];
+  //List of campaign names to exclude (leave blank for all,
+  //and do not exclude campaigns you have explicitly included)
+  var excludeCampaigns = [];// e.g. ["My campaign 1", "My campaign 2"];
+  //Enter here the currency used for the cost
+  var currency = "£";
+  ///////////////////////// END USER EDIT AREA ///////////////////////////////
+  //List of outputs to display by
+  var pivots = ["AveragePosition"];
+  generateReports(sheetURL,pivots,startDate,endDate,includePaused,includeCampaigns,excludeCampaigns,includeNoConversions,currency)
+}
+//Put it all together and generate reports
+function generateReports(sheetURL,pivots,startDate,endDate,includePaused,includeCampaigns,excludeCampaigns,includeNoConversions,currency){
+  //Open the sheet provided by the user
+  var ss = SpreadsheetApp.openByUrl(sheetURL);
+  var start = convertPrettyDateToAQL(startDate);
+  var end = convertPrettyDateToAQL(endDate);
+  //Continue only if valid dates
+  if (start != undefined && end != undefined){
+    //Pivot by each of the five categories
+    for (var i=0;i<pivots.length;i++){
+      var pivot = pivots[i];
+      Logger.log("Retrieving Adwords data for " + pivot + "...");
+      addReportToSheetWithName(ss,sheetURL,pivot,start,end,includePaused,includeCampaigns,excludeCampaigns,includeNoConversions,currency);
+    }
+  }
+  else{
+    Logger.log("Dates entered not in correct format! Please make sure you enter them in the format specified: 2018-04-10 (YYYY-MM-DD)");
+  }
+}
+//Retrieve AdWords reporting data
+function generateAdWordsReport(sheetURL,pivot,start,end,paused,include,exclude,includeNoConversions){
+  var includes = "";
+  //If paused ads need to be shown, add it to the query, otherwise keep it as it is
+  var includePausedText = (paused ? "" : " Status = ENABLED ");
+  includes = addToQuery(includes,includePausedText);
+  //If include/exclude campaigns contain names, add them to the query, otherwise keep it as it is
+  var includeCampaignsText = include.length>0 ? (" CampaignName IN " + formatTextForQuerySet(include)) : "";
+  includes = addToQuery(includes,includeCampaignsText);
+  var excludeCampaignsText = exclude.length>0 ? (" CampaignName NOT_IN " + formatTextForQuerySet(exclude)) : "";
+  includes = addToQuery(includes,excludeCampaignsText);
+  if (!includeNoConversions){
+    includes = addToQuery(includes," Conversions > 0 ");
+  }
+  var query =   "SELECT " + pivot + ", Date, Clicks, Impressions, Cost, Conversions, AllConversionValue " +
+          "FROM KEYWORDS_PERFORMANCE_REPORT " +
+          includes +
+          "DURING " + start + "," + end;
+  var report = AdWordsApp.report(query);
+  return report;
+}
+//Generate report and fill sheet
+function addReportToSheetWithName(ss,sheetURL,pivot,start,end,paused,include,exclude,conversions,currency){
+  //Get or create the sheet with the pivot specified
+  var sheet = ss.getSheetByName(pivot);
+  if (sheet == undefined){
+      sheet = ss.insertSheet(pivot);
+  }
+  //Create the report
+  var report = generateAdWordsReport(sheetURL,pivot,start,end,paused,include,exclude,conversions);
+  //Add the data to the sheet. If the data exceeds the max sheet size,
+  //log it so the user knows
+  Logger.log("Pivotting the data for " + pivot);
+  var data = getRowsAndAggregateToUnique(report,pivot, "Date");
+  var averagedData = takeAveragesByPosition(data,pivot);
+  var asArray = getObjectAsArray(averagedData,pivot);
+  try{
+    Logger.log("Writing data to the sheet\n");
+    if (asArray.length>0){
+      var range = sheet.getRange(1,1,asArray.length,asArray[0].length);
+      sheet.clear();
+      range.setValues(asArray);
+      sheet.setFrozenRows(1);
+      // Pct format
+      var column = sheet.getRange("F2:G");
+      column.setNumberFormat("0.##%")
+      // Currency format
+      column = sheet.getRange("H2:H");
+      column.setNumberFormat(currency + "#,##0.00");
+      // Number format
+      column = sheet.getRange("B2:E");
+      column.setNumberFormat("0.##")
+      column = sheet.getRange("I2:J");
+      column.setNumberFormat("0.##")
+      // Sort by position ascending
+      if (sheet.getFilter() != null){
+        sheet.getFilter().remove();
+      }
+      range.createFilter().sort(1, true);
+    }
+  }
+  catch(e){
+    Logger.log(e);
+  }
+}
+//Format array as AQL set
+function formatTextForQuerySet(array){
+  var awq = "[";
+  Logger.log(array);
+  for (var i=0;i<array.length;i++){
+    var item = "'" + array[i] + "'";
+    var isLast = (i==array.length-1);
+    awq += item + (isLast?"":",");
+    Logger.log(awq);
+  }
+  awq += "] ";
+  return awq;
+}
+//Add to query filter
+function addToQuery(queryBuilder,newQueryItem){
+  //no new queries to add
+  if (newQueryItem == ""){
+    return queryBuilder;
+  }
+  //add 'WHERE' or 'AND' depending on blank statement or existing statement
+  if (queryBuilder == ""){
+    queryBuilder +=  " WHERE " + newQueryItem;
+  }
+  else{
+    queryBuilder += " AND " + newQueryItem;
+  }
+  return queryBuilder;
+}
+//Retrieve rows for further processing and aggregation of data
+function getRowsAndAggregateToUnique(report,pivot,secondPivot){
+  var rows = report.rows();
+  var data = {};
+  while (rows.hasNext()){
+    var row = rows.next();
+    var dataRow = [];
+    var keys = Object.keys(row);
+    var pivotFormatted = parseFloat(row[pivot]).toFixed(1) + "%-%" + row[secondPivot] ;
+    if (data[pivotFormatted] == undefined){
+      data[pivotFormatted] = {'Count': 0};
+    }
+    for (var i=0;i<keys.length;i++){
+      if (keys[i]!=pivot){
+        if (data[pivotFormatted][keys[i]] == undefined){
+          data[pivotFormatted][keys[i]] = 0;
+        }
+        var n = readNumber(row[keys[i]]);
+        var value = isNaN(n) ? 0 : n;
+        data[pivotFormatted][keys[i]] += value*1;
+      }
+    }
+    data[pivotFormatted]['Count'] = data[pivotFormatted]['Count'] + 1;
+  }
+  return data;
+}
+//Data comes pivotted by position and date. We want to average the daily data, and then average across all days by position
+function takeAveragesByPosition(data,pivot){
+  var pivotKeys = Object.keys(data);
+  var dataByPosition = {}
+  for (var i=0;i<pivotKeys.length;i++){
+    var pivotKey = pivotKeys[i];
+    var position = pivotKey.split("%-%")[0];
+    if (dataByPosition[position] == undefined){
+      dataByPosition[position] = {"Count" :0};
+    }
+    var keys = Object.keys(data[pivotKey]);
+    dataByPosition[position]['Count'] = dataByPosition[position]['Count'] + 1;
+    for (var j=0;j<keys.length;j++){
+      if (keys[j]!="Count"){
+        if (dataByPosition[position][keys[j] + " (single)"] == undefined){
+          dataByPosition[position][keys[j] + " (single)"] = 0;
+        }
+        var n = readNumber( data[pivotKey][keys[j]]);
+        var value = isNaN(n) ? 0 : n;
+        dataByPosition[position][keys[j] + " (single)"] += value*1;
+        //update averages on every new instance added
+        dataByPosition[position][keys[j]] = dataByPosition[position][keys[j] + " (single)"];
+        dataByPosition[position]["Ctr"] = safeDivide(dataByPosition[position]["Clicks"],dataByPosition[position]["Impressions"])
+        dataByPosition[position]["ConversionRate"] =  safeDivide(dataByPosition[position]["Conversions"],dataByPosition[position]["Clicks"]);
+        dataByPosition[position]["CostPerConversion"] = safeDivide(dataByPosition[position]["Cost"],dataByPosition[position]["Conversions"]);
+        dataByPosition[position]["ROAS"] = safeDivide(dataByPosition[position]["AllConversionValue"],dataByPosition[position]["Cost"]);
+      }
+    }
+  }
+  return dataByPosition;
+}
+//Safe derived column calculation
+function safeDivide(numerator,denominator){
+  var value = ( isNaN(numerator)
+               || (denominator == 0)
+               || isNaN(denominator)
+               || isNaN(numerator / denominator)
+              )? 0 : (numerator/ denominator);
+  return value;
+}
+//Convert the object to an array so it can be written to sheets
+function getObjectAsArray(obj,pivot){
+  var keys = Object.keys(obj);
+  //first add the headers
+  var rows = [[pivot,"Clicks","Impressions","Cost","Conversions","Ctr","Conversion rate","Cost per conversion","Total conversion volume", "ROAS"]];
+  //keywords col: obj[keys[i]]["Criteria"],
+  //now add the data
+  for (var i=0;i<keys.length;i++){
+    var row = [keys[i] , obj[keys[i]]["Clicks"] , obj[keys[i]]["Impressions"] , obj[keys[i]]["Cost"]
+               , obj[keys[i]]["Conversions"] , obj[keys[i]]["Ctr"] , obj[keys[i]]["ConversionRate"]
+               ,obj[keys[i]]["CostPerConversion"] , obj[keys[i]]["AllConversionValue"], obj[keys[i]]["ROAS"]];
+    rows.push(row);
+  }
+  return rows;
+}
+//Fix the raw format returned by the report
+function readNumber(textNumber){
+  if (typeof textNumber == 'string'){
+    textNumber = textNumber.replace(',', '');
+    return parseFloat(textNumber);
+  }
+  return textNumber;
+}
+//Convert user input date into AQL format
+function convertPrettyDateToAQL(date){
+  var split = date.toString().split("-");
+  if (split.length == 3){
+    var year = split[0];
+    var month = split[1];
+    var day = split[2];
+    var checks = (year.length == 4) && (month <12) && (day <32);
+    if (checks){
+      var monthString = (month.toString().length == 1)?("0" + month.toString()):month.toString();
+      var dayString = (day.toString().length == 1)?("0" + day.toString()):day.toString();
+      var dateOut = year.toString() + monthString + dayString;
+      return dateOut;
+    }
+  }
+  //fallback
+  return undefined;
+}
